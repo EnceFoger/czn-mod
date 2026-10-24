@@ -14,6 +14,8 @@
 #include <cstdarg>
 #include <cmath>
 #include <thread>
+#include <functional>
+#include <string>
 #include "zygisk.hpp"
 
 #define PKG "com.smilegate.chaoszero.stove.google"
@@ -24,9 +26,58 @@ static const uintptr_t OFF_GET_INSTANCE = 0x1cb7070; // Director::getInstance()
 static const uintptr_t OFF_SET_FACTOR   = 0x2162acc; // Director::setTimeScaleFactor(float)
 static const uintptr_t OFF_GET_FACTOR   = 0x2162bf8; // Director::getTimeScaleFactor()
 
+static const uintptr_t OFF_SCHED_BY_IDX = 0x1cbc5c8; // Director::getSchedulerByIndex(int)
+static const uintptr_t OFF_PERFORM_FN   = 0x1cd8754; // Scheduler::performFunctionInCocosThread(std::function<void()>)
+static const uintptr_t OFF_JS_INSTANCE  = 0x20bd0c4; // JSScriptingEngine::getInstance()
+static const uintptr_t OFF_JS_EXEC_STR  = 0x20c1fc8; // JSScriptingEngine::executeString(const char*)
+
+typedef void *(*SchedByIdxFn)(void *, int);
+typedef void (*PerformFn)(void *, std::function<void()>);
+typedef void *(*JsInstanceFn)();
+typedef long (*JsExecFn)(void *, const char *);
 typedef void *(*GetInstanceFn)();
 typedef void (*SetFactorFn)(void *, float);
 typedef float (*GetFactorFn)(void *);
+
+
+static const char *RECON_JS_HEAD = R"JS((function(){
+var OUT=")JS";
+static const char *RECON_JS_BODY = R"JS(";
+var lines=[];
+var re=/dam|hp|health|atk|attack|hit|crit|shield|buff|battle|skill|combat|chara|unit|status|stat|heal|dead|kill|power|rate/i;
+function names(o){try{return Object.getOwnPropertyNames(o);}catch(e){return [];}}
+function typ(o){try{return typeof o;}catch(e){return '?';}}
+var g=(typeof globalThis!=='undefined')?globalThis:this;
+var gn=names(g);
+lines.push('GLOBALS '+gn.length+': '+gn.join(','));
+var seen=new Set(); var count=0, hits=0;
+function walk(o,path,depth){
+  if(count>30000||hits>1500||depth>4||o===null) return;
+  var t=typ(o); if(t!=='object'&&t!=='function') return;
+  if(seen.has(o)) return; seen.add(o); count++;
+  var ns=names(o);
+  for(var i=0;i<ns.length;i++){
+    var k=ns[i], d=null, v;
+    try{d=Object.getOwnPropertyDescriptor(o,k);}catch(e){}
+    if(!d) continue;
+    var isAcc=!('value' in d); v=isAcc?undefined:d.value;
+    var np=path+'.'+k;
+    if(re.test(k)){hits++; lines.push('H '+np+' ['+(isAcc?'accessor':typ(v))+']');}
+    if(!isAcc&&(typ(v)==='object'||typ(v)==='function')){
+      walk(v,np,depth+1);
+      if(typ(v)==='function'){try{walk(v.prototype,np+'.prototype',depth+1);}catch(e){}}
+    }
+  }
+}
+try{walk(g,'g',0);}catch(e){lines.push('ERR '+e);}
+lines.push('SUMMARY nodes='+count+' hits='+hits);
+var text=lines.join('\n');
+try{ if(typeof jsb!=='undefined'&&jsb.fileUtils&&jsb.fileUtils.writeStringToFile){ jsb.fileUtils.writeStringToFile(text,OUT); } }catch(e){}
+try{
+  var emit=(typeof cc!=='undefined'&&cc.log)?cc.log:((typeof console!=='undefined')?console.log:null);
+  if(emit){ for(var p=0,n=0;p<text.length;p+=700,n++){ emit('CZNDUMP:'+n+':'+text.substr(p,700)); } }
+}catch(e){}
+})();)JS";
 
 static char g_dir[256];
 static char g_cfg[300];
@@ -61,7 +112,10 @@ static const char *DEFAULT_CFG =
     "# 1.0 = fitur mati. Baris yang salah/kosong memakai nilai default.\n"
     "game_speed=1.0\n"
     "# Batas atas game_speed (1.0 .. 100.0, default 5.0):\n"
-    "max_game_speed=5.0\n";
+    "max_game_speed=5.0\n"
+    "# Pengintaian (hanya mencatat, tidak mengubah game). Masuk ke stage dulu, lalu naikkan nilainya\n"
+    "# (1, 2, 3...) setiap ingin menjalankan ulang. Hasil: czn_dump.txt di folder ini.\n"
+    "recon=0\n";
 
 static void ensure_default_cfg() {
     if (access(g_cfg, F_OK) == 0) return;
@@ -71,7 +125,7 @@ static void ensure_default_cfg() {
     logf_("config default dibuat: %s", g_cfg);
 }
 
-struct Cfg { float speed = 1.0f; float maxSpeed = 5.0f; };
+struct Cfg { float speed = 1.0f; float maxSpeed = 5.0f; int recon = 0; };
 
 static float parse_f(const char *k, const char *v, float def) {
     char *end = nullptr;
@@ -95,6 +149,7 @@ static Cfg load_cfg() {
         while (*v == ' ' || *v == '\t') v++;
         if (!strcmp(k, "game_speed")) c.speed = parse_f(k, v, 1.0f);
         else if (!strcmp(k, "max_game_speed")) c.maxSpeed = parse_f(k, v, 5.0f);
+        else if (!strcmp(k, "recon")) c.recon = (int) parse_f(k, v, 0.0f);
     }
     fclose(f);
     if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
@@ -143,11 +198,45 @@ static void worker() {
         logf_("simbol: pakai offset fallback");
     }
 
+    SchedByIdxFn schedByIdx = nullptr; PerformFn performFn = nullptr; JsInstanceFn jsInst = nullptr; JsExecFn jsExec = nullptr;
+    if (h) {
+        schedByIdx = (SchedByIdxFn) dlsym(h, "_ZN7cocos2d8Director17getSchedulerByIndexEi");
+        performFn = (PerformFn) dlsym(h, "_ZN7cocos2d9Scheduler28performFunctionInCocosThreadENSt6__ndk18functionIFvvEEE");
+        jsInst = (JsInstanceFn) dlsym(h, "_ZN7cocos2d17JSScriptingEngine11getInstanceEv");
+        jsExec = (JsExecFn) dlsym(h, "_ZN7cocos2d17JSScriptingEngine13executeStringEPKc");
+    }
+    if (!schedByIdx) schedByIdx = (SchedByIdxFn) (base + OFF_SCHED_BY_IDX);
+    if (!performFn) performFn = (PerformFn) (base + OFF_PERFORM_FN);
+    if (!jsInst) jsInst = (JsInstanceFn) (base + OFF_JS_INSTANCE);
+    if (!jsExec) jsExec = (JsExecFn) (base + OFF_JS_EXEC_STR);
+
     Cfg cfg = load_cfg();
+    int lastRecon = cfg.recon; // nilai awal tidak memicu
+    int autoCount = 0;
     float last = 1.0f, lastLogged = -1.0f;
     int tick = 0;
     for (;; tick++) {
         if (tick % 4 == 0) cfg = load_cfg(); // ~2 detik
+        bool manual = cfg.recon > 0 && cfg.recon != lastRecon;
+        bool autoRun = autoCount < 4 && tick > 0 && tick % 120 == 0; // tiap ~60 dtk, 4x, file ditimpa
+        if (manual || autoRun) {
+            lastRecon = cfg.recon;
+            if (autoRun) autoCount++;
+            void *dir = getInst();
+            void *sched = dir ? schedByIdx(dir, 0) : nullptr;
+            void *js = jsInst();
+            if (!sched || !js) logf_("recon: gagal (scheduler=%p js=%p)", sched, js);
+            else {
+                char outpath[320]; snprintf(outpath, sizeof outpath, "%s/czn_dump.txt", g_dir);
+                std::string script = std::string(RECON_JS_HEAD) + outpath + RECON_JS_BODY;
+                logf_("recon (%s): dikirim ke thread utama", autoRun ? "otomatis" : "manual");
+                JsExecFn ex = jsExec;
+                performFn(sched, [js, ex, script]() {
+                    ex(js, script.c_str());
+                    logf_("recon: selesai dijalankan di thread utama");
+                });
+            }
+        }
         if (cfg.speed != 1.0f || last != 1.0f) {
             void *dir = getInst();
             if (dir) {
