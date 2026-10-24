@@ -1,8 +1,10 @@
-namename: build
+name: build
 on: [push, workflow_dispatch]
+permissions:
+  contents: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Ambil zygisk.hpp
@@ -10,11 +12,16 @@ jobs:
       - name: Build
         run: |
           $ANDROID_NDK_LATEST_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk
-          mkdir -p pkg/zygisk
+          mkdir -p pkg/zygisk pkg/META-INF/com/google/android
           cp libs/arm64-v8a/libczn_speed.so pkg/zygisk/arm64-v8a.so
           cp module.prop customize.sh pkg/
-          cd pkg && zip -r ../czn_speed.zip .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: czn_speed
-          path: czn_speed.zip
+          curl -fsSL -o pkg/META-INF/com/google/android/update-binary https://raw.githubusercontent.com/topjohnwu/Magisk/master/scripts/module_installer.sh
+          echo "#MAGISK" > pkg/META-INF/com/google/android/updater-script
+      - name: Package
+        run: |
+          cd pkg && zip -r ../czn_speed.zip . && cd ..
+          unzip -l czn_speed.zip
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ github.run_number }}" czn_speed.zip --title "czn_speed ${{ github.run_number }}" --notes build
