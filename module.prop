@@ -1,0 +1,6 @@
+id=czn_speed
+name=CZN Speed
+version=1.0
+versionCode=1
+author=-
+description=Pengali kecepatan game Chaos Zero Nightmare (Zygisk). Atur di /data/adb/czn_speed.conf
